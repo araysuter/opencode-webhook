@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.1 — 2026-11-27
+
+- Running tools no longer trip the 10-minute stall watchdog. While a
+  tool part is in state `running`, the plugin waits for the command's
+  `timeout N` prefix or the tool's timeout arg, plus 5 minutes. If
+  neither can be parsed, it falls back to
+  `OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES` (default 60). A bad or
+  zero cap still falls back to 60, so a hang is never silenced. The
+  stalled payload includes the tool name and how many minutes it had
+  been running. Sessions with no running tool keep the 10-minute
+  behavior. Dedupe is unchanged.
+
+
 ## 1.3.0 — 2026-11-27
 
 - `retrying`: ping on the first `session.status` of type `retry` (model or

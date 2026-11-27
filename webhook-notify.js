@@ -17,6 +17,13 @@
  *                                  tool_error (tool_error is off by default) or full event names.
  *   OPENCODE_NOTIFY_STALL_MINUTES  Optional. Busy with no activity this long = "stalled" ping.
  *                                  Default 10. 0 disables the watchdog.
+ *   OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES
+ *                                  Optional. While a tool is still running, wait this many
+ *                                  minutes instead of STALL_MINUTES (default 60). If the
+ *                                  bash command starts with `timeout N` or the tool has a
+ *                                  timeout arg, wait that timeout plus 5 minutes instead.
+ *                                  A missing or invalid value falls back to 60; a running
+ *                                  tool never disables the watchdog entirely.
  *   OPENCODE_NOTIFY_DEBUG          Optional. 1/true for verbose logs.
  *
  * OpenCode 1.19.6 path plugins must default-export an object with `id`
@@ -44,6 +51,8 @@ const TURN_DEDUPE_MS = 2_000
 const ERROR_IDLE_DEDUPE_MS = 15_000
 
 const DEFAULT_STALL_MINUTES = 10
+const DEFAULT_RUNNING_TOOL_STALL_MINUTES = 60
+const RUNNING_TOOL_GRACE_MS = 5 * 60_000
 
 // Bus event names verified against the OpenCode 1.19.6 binary.
 // "stalled" and "tool.error" are synthetic (made by this plugin).
@@ -87,6 +96,159 @@ function stallMinutes(raw) {
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_STALL_MINUTES
 }
 
+function runningToolStallMinutes(raw) {
+  if (raw === "") return DEFAULT_RUNNING_TOOL_STALL_MINUTES
+  const n = Number(raw)
+  // 0 or a bad value would suppress hangs; Asher prefers a false ping to a missed one.
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RUNNING_TOOL_STALL_MINUTES
+}
+
+function durationToMs(token) {
+  if (token == null) return null
+  const m = String(token).trim().match(/^(\d+(?:\.\d+)?)([smhd])?$/i)
+  if (!m) return null
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n < 0) return null
+  const unit = (m[2] || "s").toLowerCase()
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit]
+  return n * mult
+}
+
+function msFromTimeoutArg(value) {
+  if (value == null || value === "") return null
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : null
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    // Suffixed values like "2m" are durations. Bare numbers are milliseconds
+    // (OpenCode's bash tool timeout arg).
+    if (/^\d+(?:\.\d+)?[smhd]$/i.test(trimmed)) return durationToMs(trimmed)
+    const n = Number(trimmed)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  return null
+}
+
+function tokenizeShell(text) {
+  const tokens = []
+  let cur = ""
+  let quote = null
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < text.length) {
+        cur += text[++i]
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+        continue
+      }
+      cur += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (cur) tokens.push(cur)
+      cur = ""
+      continue
+    }
+    cur += ch
+  }
+  if (cur) tokens.push(cur)
+  return tokens
+}
+
+const TIMEOUT_FLAGS = new Set(["--foreground", "--preserve-status", "--verbose", "-v"])
+
+function parseTimeoutPrefixMs(simple) {
+  let s = String(simple || "").trim()
+  s = s.replace(/^(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*')\s+)*/, "")
+  s = s.replace(/^(?:sudo\s+(?:-\S+\s+)*|nice\s+(?:-n\s+\S+\s+)?|command\s+|env\s+)*/i, "")
+  const tokens = tokenizeShell(s)
+  if (!tokens.length) return null
+  const cmd = tokens[0].split("/").pop().toLowerCase()
+  if (cmd !== "timeout") return null
+  let i = 1
+  while (i < tokens.length) {
+    const t = tokens[i]
+    if (t === "--") {
+      i++
+      break
+    }
+    if (TIMEOUT_FLAGS.has(t)) {
+      i++
+      continue
+    }
+    if (t === "-k" || t === "--kill-after") {
+      i += 2
+      continue
+    }
+    if (t.startsWith("--kill-after=")) {
+      i++
+      continue
+    }
+    if (t === "-s" || t === "--signal") {
+      i += 2
+      continue
+    }
+    if (t.startsWith("--signal=")) {
+      i++
+      continue
+    }
+    if (t.startsWith("-") && t !== "-") {
+      i++
+      continue
+    }
+    break
+  }
+  if (i >= tokens.length) return null
+  return durationToMs(tokens[i])
+}
+
+function parseCommandTimeoutMs(command) {
+  if (typeof command !== "string" || !command.trim()) return null
+  try {
+    for (const chunk of command.split(/(?:&&|\|\||;|\n|\|)/)) {
+      const ms = parseTimeoutPrefixMs(chunk)
+      if (ms != null && ms > 0) return ms
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+function toolInputOf(part) {
+  return part?.state?.input || part?.input || {}
+}
+
+function explicitToolTimeoutMs(part) {
+  const input = toolInputOf(part)
+  const candidates = []
+  const fromArg = msFromTimeoutArg(input.timeout ?? input.timeoutMs ?? input.timeout_ms)
+  if (fromArg != null) candidates.push(fromArg)
+  const fromCmd = parseCommandTimeoutMs(input.command || input.cmd || "")
+  if (fromCmd != null) candidates.push(fromCmd)
+  return candidates.length ? Math.min(...candidates) : null
+}
+
+function runningToolLimitMs(part, capMinutes) {
+  const cap = (Number.isFinite(capMinutes) && capMinutes > 0 ? capMinutes : DEFAULT_RUNNING_TOOL_STALL_MINUTES) * 60_000
+  const explicit = explicitToolTimeoutMs(part)
+  if (explicit == null) return cap
+  return explicit + RUNNING_TOOL_GRACE_MS
+}
+
+function toolPartOf(event) {
+  if (event?.type !== "message.part.updated") return null
+  const part = bagOf(event).part
+  return part?.type === "tool" ? part : null
+}
+
 function readConfig() {
   return {
     url: env("OPENCODE_NOTIFY_WEBHOOK_URL", ""),
@@ -95,6 +257,7 @@ function readConfig() {
     events: parseEventFilter(env("OPENCODE_NOTIFY_EVENTS", "")),
     debug: truthy(env("OPENCODE_NOTIFY_DEBUG", "")),
     stallMinutes: stallMinutes(env("OPENCODE_NOTIFY_STALL_MINUTES", "")),
+    runningToolStallMinutes: runningToolStallMinutes(env("OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES", "")),
   }
 }
 
@@ -431,16 +594,29 @@ function createRuntime() {
     return false
   }
 
-  // Watchdog state per session: busy flag, last activity, open prompts.
+  // Watchdog state per session: busy flag, last activity, open prompts, running tools.
   const sessions = new Map()
   const errorPinged = new Map()
+
+  function rememberRunningTool(s, part, capMinutes) {
+    const id = part.callID || part.id || `anon:${part.tool || "tool"}`
+    const prev = s.running.get(id)
+    const started = Number(part.state?.time?.start)
+    s.running.set(id, {
+      tool: part.tool || prev?.tool || "tool",
+      startedAt: Number.isFinite(started) && started > 0 ? started : (prev?.startedAt || Date.now()),
+      limitMs: runningToolLimitMs(part, capMinutes),
+    })
+    return id
+  }
+
   function track(event) {
     const sessionID = sessionIDOf(event)
     if (!sessionID || event.type === "stalled") return
     const bag = bagOf(event)
     let s = sessions.get(sessionID)
     if (!s) {
-      s = { busy: false, last: Date.now(), stalledSent: false, open: new Set() }
+      s = { busy: false, last: Date.now(), stalledSent: false, open: new Set(), running: new Map() }
       sessions.set(sessionID, s)
       if (sessions.size > 500) sessions.delete(sessions.keys().next().value)
     }
@@ -450,13 +626,35 @@ function createRuntime() {
       s.retry = { attempt: bag.status.attempt ?? null, message: clip(bag.status.message || "") }
       return
     }
+
+    const part = toolPartOf(event)
+    if (part) {
+      const status = part.state?.status
+      const id = part.callID || part.id
+      if (status === "running") {
+        const key = id || `anon:${part.tool || "tool"}`
+        const already = s.running.has(key)
+        rememberRunningTool(s, part, readConfig().runningToolStallMinutes)
+        s.busy = true
+        if (already) return
+      } else if (status === "completed" || status === "error") {
+        if (id) s.running.delete(id)
+        else s.running.delete(`anon:${part.tool || "tool"}`)
+      }
+    } else if (event.type === "session.status" && bag.status?.type === "busy" && s.busy && s.running.size) {
+      // Still busy with a tool in flight; a repeat "busy" is not progress.
+      return
+    }
+
     if (event.type !== "session.status") s.retryPinged = false
     s.last = Date.now()
     s.stalledSent = false
     s.retry = null
     if (event.type === "session.status") s.busy = bag.status?.type !== "idle"
-    else if (event.type === "session.idle" || event.type === "session.deleted") s.busy = false
-    else if (event.type === "permission.asked" || event.type === "question.asked") s.open.add(bag.id)
+    else if (event.type === "session.idle" || event.type === "session.deleted") {
+      s.busy = false
+      s.running.clear()
+    } else if (event.type === "permission.asked" || event.type === "question.asked") s.open.add(bag.id)
     else if (/^(permission|question)\.(replied|rejected)$/.test(event.type)) s.open.delete(bag.requestID || bag.id)
     if (event.type === "session.deleted") sessions.delete(sessionID)
   }
@@ -468,7 +666,31 @@ function createRuntime() {
     const limit = cfg.stallMinutes * 60_000
     for (const [sessionID, s] of sessions) {
       // Blocked sessions already got a "blocked" ping; don't double up.
-      if (!s.busy || s.stalledSent || s.open.size || now - s.last < limit) continue
+      if (!s.busy || s.stalledSent || s.open.size) continue
+      const running = [...(s.running?.values() || [])]
+      if (running.length) {
+        const hung = running
+          .filter((t) => now - t.startedAt >= t.limitMs)
+          .sort((a, b) => (now - b.startedAt) - (now - a.startedAt))[0]
+        if (!hung) continue
+        s.stalledSent = true
+        out.push({
+          type: "stalled",
+          properties: {
+            sessionID,
+            since: hung.startedAt,
+            detail: {
+              minutesSinceActivity: Math.floor((now - s.last) / 60_000),
+              lastActivity: new Date(s.last).toISOString(),
+              retry: s.retry || null,
+              tool: hung.tool,
+              minutesRunning: Math.floor((now - hung.startedAt) / 60_000),
+            },
+          },
+        })
+        continue
+      }
+      if (now - s.last < limit) continue
       s.stalledSent = true
       out.push({
         type: "stalled",

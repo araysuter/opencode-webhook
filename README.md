@@ -63,6 +63,13 @@ export OPENCODE_NOTIFY_EVENTS="idle,error,blocked,stalled"
 # many minutes (resets on any activity). Default 10. 0 turns it off.
 export OPENCODE_NOTIFY_STALL_MINUTES=10
 
+# If a tool is still running (e.g. a long bash command with no output),
+# wait this many minutes instead of STALL_MINUTES. Default 60. 0 or a
+# bad value falls back to 60 — a running tool never disables the
+# watchdog. If the command starts with `timeout N` or the tool has a
+# timeout arg, that timeout plus 5 minutes is used instead.
+export OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES=60
+
 # Verbose logs, prefixed with "opencode-webhook:". Never logs the secret
 # or the URL query string.
 export OPENCODE_NOTIFY_DEBUG=1
@@ -139,7 +146,7 @@ Switch on `kind`:
 | `interrupted` | `interrupted` | v2 `session.execution.interrupted` | `null` |
 | `blocked` | `blocked` | `permission.asked` or `question.asked` — the session is waiting for an answer | `{ reason: "permission" \| "question", requestID, permission, patterns, command }` or `{ reason, requestID, question }` |
 | `retrying` | `retrying` | First `session.status` of type `retry`: a model/API call failed and OpenCode is retrying (e.g. the model server is out of memory or down). Once per retry streak; re-arms after real progress. | `{ attempt, message, nextRetryAt }` |
-| `stalled` | `stalled` | Busy with no message/tool/permission activity for `OPENCODE_NOTIFY_STALL_MINUTES` | `{ minutesSinceActivity, lastActivity }` |
+| `stalled` | `stalled` | Busy with no message/tool/permission activity for `OPENCODE_NOTIFY_STALL_MINUTES`. A tool still in `running` state uses a longer wait: the command's `timeout N` / tool timeout arg plus 5 minutes, or `OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES` (default 60) if neither can be parsed | `{ minutesSinceActivity, lastActivity }` and, when a tool was running, `tool`, `minutesRunning` |
 | `tool_error` | `tool_error` | A tool call errored (opt-in group) | `{ tool, error }` |
 
 `status` keeps the old values (`idle`, `error`, `interrupted`) so older
@@ -148,7 +155,9 @@ receivers keep working; new kinds use `status` = `kind`.
 Each problem is sent once: one `blocked` per permission request, one
 `stalled` per quiet stretch (it re-arms after new activity), one
 `tool_error` per tool call. A session blocked on a prompt does not also
-get a `stalled` ping.
+get a `stalled` ping. Output from a tool that is still running does not
+reset that stall, so a command that overruns its timeout is not pinged
+twice just because it printed a line.
 
 A `blocked` ping means OpenCode is waiting for a reply. Answer it with
 `POST /permission/<requestID>/reply` and `{"reply":"once"|"always"|"reject"}`,

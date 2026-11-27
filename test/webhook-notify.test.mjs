@@ -572,7 +572,7 @@ function ev(type, properties, id) {
 async function withPlugin(vars, fn) {
   const col = await startCollector()
   try {
-    await withEnv({ OPENCODE_NOTIFY_WEBHOOK_URL: col.url, OPENCODE_NOTIFY_TITLE_PREFIX: null, OPENCODE_NOTIFY_EVENTS: null, OPENCODE_NOTIFY_STALL_MINUTES: null, ...vars }, async () => {
+    await withEnv({ OPENCODE_NOTIFY_WEBHOOK_URL: col.url, OPENCODE_NOTIFY_TITLE_PREFIX: null, OPENCODE_NOTIFY_EVENTS: null, OPENCODE_NOTIFY_STALL_MINUTES: null, OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: null, ...vars }, async () => {
       const plugin = (await freshImport()).default
       const hooks = await plugin.server({ directory: "/tmp/demo" })
       try {
@@ -754,6 +754,194 @@ test("first model retry pings retrying once per streak, re-arms after progress",
     assert.equal(col.posts.length, 2)
   })
 })
+
+function runningPart({ sessionID, callID = "call_run", tool = "bash", command = "sleep 3600", timeout, start }) {
+  const input = { command, description: "run long command" }
+  if (timeout != null) input.timeout = timeout
+  return {
+    type: "tool",
+    sessionID,
+    callID,
+    tool,
+    state: { status: "running", input, time: { start: start ?? Date.now() } },
+  }
+}
+
+function completedPart(part, at = Date.now()) {
+  return {
+    ...part,
+    state: { ...part.state, status: "completed", output: "done", title: "done", time: { start: part.state.time?.start || at, end: at } },
+  }
+}
+
+test("running tool uses the longer cap, not the 10-minute stall", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "2" }, async (hooks, col) => {
+    const start = Date.now()
+    await hooks.event(ev("session.status", { sessionID: "ses_rt1", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_rt1", start }) }))
+    col.posts.length = 0
+    await hooks.__checkStalls(start + 61_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 2 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+    const b = col.posts[0].body
+    assert.equal(b.kind, "stalled")
+    assert.equal(b.detail.tool, "bash")
+    assert.ok(b.detail.minutesRunning >= 2)
+  })
+})
+
+test("bash timeout prefix waits timeout plus 5 minutes, not the cap", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "30" }, async (hooks, col) => {
+    const start = Date.now()
+    const command = "timeout 60 python compare.py | tail -40"
+    await hooks.event(ev("session.status", { sessionID: "ses_to", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_to", command, start }) }))
+    col.posts.length = 0
+    // 60s + 5 min = 6 min. Still under at 5:59.
+    await hooks.__checkStalls(start + 5 * 60_000 + 59_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 6 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.detail.tool, "bash")
+    assert.ok(col.posts[0].body.detail.minutesRunning >= 6)
+  })
+})
+
+test("tool timeout arg is milliseconds plus 5 minutes", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "30" }, async (hooks, col) => {
+    const start = Date.now()
+    await hooks.event(ev("session.status", { sessionID: "ses_ta", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_ta", command: "sleep 3600", timeout: 120_000, start }) }))
+    col.posts.length = 0
+    await hooks.__checkStalls(start + 6 * 60_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 7 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+  })
+})
+
+test("when both timeouts exist, the shorter one plus 5 minutes wins", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "30" }, async (hooks, col) => {
+    const start = Date.now()
+    await hooks.event(ev("session.status", { sessionID: "ses_both", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({
+      sessionID: "ses_both",
+      command: "timeout 3600 python compare.py",
+      timeout: 120_000,
+      start,
+    }) }))
+    col.posts.length = 0
+    await hooks.__checkStalls(start + 6 * 60_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 7 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+  })
+})
+
+test("unparseable timeout prefix falls back to the running-tool cap", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "2" }, async (hooks, col) => {
+    const start = Date.now()
+    await hooks.event(ev("session.status", { sessionID: "ses_bad", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_bad", command: "timeout later sleep 10", start }) }))
+    col.posts.length = 0
+    await hooks.__checkStalls(start + 61_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 2 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.detail.tool, "bash")
+  })
+})
+
+test("timeout is not parsed from a later flag like --timeout", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "2" }, async (hooks, col) => {
+    const start = Date.now()
+    await hooks.event(ev("session.status", { sessionID: "ses_flag", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_flag", command: "python compare.py --timeout 3600", start }) }))
+    col.posts.length = 0
+    await hooks.__checkStalls(start + 61_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(start + 2 * 60_000 + 1_000)
+    assert.equal(col.posts.length, 1)
+  })
+})
+
+test("timeout prefix forms: sudo, path, env, &&, and GNU flags", async () => {
+  const grace = 5 * 60_000
+  const cases = [
+    ["sudo timeout 2m sleep 100", 2 * 60_000 + grace],
+    ["/usr/bin/timeout 10s sleep 100", 10_000 + grace],
+    ["cd /tmp && timeout 3 sleep 100", 3_000 + grace],
+    ["FOO=bar timeout --foreground 1m sleep 100", 60_000 + grace],
+    ["timeout --preserve-status -k 5 90 sleep 100", 90_000 + grace],
+    ["timeout 1h python compare.py | tail -40", 3_600_000 + grace],
+  ]
+  for (const [command, limitMs] of cases) {
+    await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "90" }, async (hooks, col) => {
+      const start = Date.now()
+      const sessionID = "ses_" + command.length + limitMs
+      await hooks.event(ev("session.status", { sessionID, status: { type: "busy" } }))
+      await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID, command, start, callID: "c_" + limitMs + command.length }) }))
+      col.posts.length = 0
+      await hooks.__checkStalls(start + limitMs - 2_000)
+      assert.equal(col.posts.length, 0, `early ping for: ${command}`)
+      await hooks.__checkStalls(start + limitMs + 1_000)
+      assert.equal(col.posts.length, 1, `missing ping for: ${command}`)
+    })
+  }
+})
+
+test("after the tool finishes, the normal stall window applies again", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "30" }, async (hooks, col) => {
+    const start = Date.now()
+    const part = runningPart({ sessionID: "ses_done", start })
+    await hooks.event(ev("session.status", { sessionID: "ses_done", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part }))
+    await hooks.__checkStalls(start + 61_000)
+    assert.equal(col.posts.filter((p) => p.body.kind === "stalled").length, 0)
+    await hooks.event(ev("message.part.updated", { part: completedPart(part) }))
+    col.posts.length = 0
+    const after = Date.now()
+    await hooks.__checkStalls(after + 30_000)
+    assert.equal(col.posts.length, 0)
+    await hooks.__checkStalls(after + 61_000)
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.kind, "stalled")
+    assert.equal(col.posts[0].body.detail.tool, undefined)
+    assert.equal(col.posts[0].body.detail.minutesRunning, undefined)
+  })
+})
+
+test("running-tool stall pings once; later output from the same tool does not retrigger", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: "2" }, async (hooks, col) => {
+    const start = Date.now()
+    const part = runningPart({ sessionID: "ses_dupe", start })
+    await hooks.event(ev("session.status", { sessionID: "ses_dupe", status: { type: "busy" } }))
+    await hooks.event(ev("message.part.updated", { part }))
+    await hooks.__checkStalls(start + 2 * 60_000 + 1_000)
+    assert.equal(col.posts.filter((p) => p.body.kind === "stalled").length, 1)
+    await hooks.event(ev("message.part.updated", { part: { ...part, state: { ...part.state, metadata: { output: "tick" } } } }))
+    await hooks.event(ev("session.status", { sessionID: "ses_dupe", status: { type: "busy" } }))
+    await hooks.__checkStalls(start + 4 * 60_000)
+    assert.equal(col.posts.filter((p) => p.body.kind === "stalled").length, 1)
+  })
+})
+
+test("RUNNING_TOOL_STALL_MINUTES of 0 or junk falls back to 60, never off", async () => {
+  for (const value of ["0", "nope", "-5"]) {
+    await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1", OPENCODE_NOTIFY_RUNNING_TOOL_STALL_MINUTES: value }, async (hooks, col) => {
+      const start = Date.now()
+      await hooks.event(ev("session.status", { sessionID: "ses_cap", status: { type: "busy" } }))
+      await hooks.event(ev("message.part.updated", { part: runningPart({ sessionID: "ses_cap", start }) }))
+      col.posts.length = 0
+      await hooks.__checkStalls(start + 2 * 60_000)
+      assert.equal(col.posts.length, 0, `unexpected early ping for ${value}`)
+      await hooks.__checkStalls(start + 60 * 60_000 + 1_000)
+      assert.equal(col.posts.length, 1, `missing cap ping for ${value}`)
+    })
+  }
+})
+
 
 let failed = 0
 for (const { name, fn } of tests) {
