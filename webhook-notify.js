@@ -1,44 +1,42 @@
 /**
  * opencode-webhook
  *
- * POSTs a JSON webhook when an OpenCode agent finishes or errors, so
- * another bot or service can hand off a coding task and hear back.
+ * POSTs JSON when an OpenCode session finishes or errors, so another
+ * bot or service can hand off a task and get pinged when it is done.
  *
- * Install: copy this file to ~/.config/opencode/plugins/ (or
- * .opencode/plugins/ in a project) and restart OpenCode.
+ * Install: copy this file to ~/.config/opencode/plugins/ or
+ * .opencode/plugins/ in a project, then restart OpenCode.
  *
- * Environment (set these in the same process that starts OpenCode):
+ * Environment (must be in the same process that starts OpenCode):
  *
- *   OPENCODE_NOTIFY_WEBHOOK_URL    Required. URL that receives the POST.
- *   OPENCODE_NOTIFY_SECRET         Optional. Authorization header value
- *                                  (see OPENCODE_NOTIFY_AUTH_SCHEME).
- *   OPENCODE_NOTIFY_AUTH_SCHEME    Optional. Default "Bearer" sends
- *                                  "Authorization: Bearer <secret>".
- *                                  Set to "raw" to send the secret as
- *                                  the entire Authorization value.
- *   OPENCODE_NOTIFY_TITLE_PREFIX   Optional. If set, only sessions whose
- *                                  title starts with this prefix are posted.
- *                                  Unset = notify every finished session.
- *   OPENCODE_NOTIFY_EVENTS         Optional. Comma-separated list of
- *                                  "idle", "error", "interrupted", or full
- *                                  event type names. Default: all of them.
- *   OPENCODE_NOTIFY_DEBUG          Optional. Set to 1/true for verbose logs.
+ *   OPENCODE_NOTIFY_WEBHOOK_URL    Required. http(s) URL that receives the POST.
+ *   OPENCODE_NOTIFY_SECRET         Optional. Sent as Authorization: Bearer <secret>.
+ *   OPENCODE_NOTIFY_TITLE_PREFIX   Optional. Only sessions whose title starts with this.
+ *   OPENCODE_NOTIFY_EVENTS         Optional. idle,error,interrupted or full event names.
+ *   OPENCODE_NOTIFY_DEBUG          Optional. 1/true for verbose logs.
  *
- * OpenCode 1.19+ loads: export default { id, server }.
- * server(ctx) is called with { client, project, directory, worktree, $ }
- * and must return a hooks object (including `event`). See
- * https://github.com/sst/opencode/blob/v1.19.6/packages/opencode/src/plugin/shared.ts
- * and .../plugin/index.ts. Older loaders that look for a plugin function
- * can use the named export `DoneWebhook` / `Plugin`.
+ * OpenCode 1.19.6 path plugins must default-export an object with `id`
+ * and `server()`. A `{ id, setup }` default is rejected with
+ * `must default export an object with server()`. See:
+ *   https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/shared.ts
+ *   https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/index.ts
+ *   https://cdn.jsdelivr.net/npm/@opencode-ai/plugin@1.19.6/dist/index.d.ts
  *
- * This file must not throw: a plugin error should never take down OpenCode.
+ * server(input, options) receives PluginInput
+ *   { client, project, directory, worktree, $, ... }
+ * and must return a Hooks object. 1.19.6 delivers bus events as:
+ *   hook.event({ event: { id, type, properties: event.data } })
+ * so session.idle is `{ type: "session.idle", properties: { sessionID } }`.
+ * Some builds still use `data` instead of `properties`; both are read.
+ *
+ * This file must never throw: a plugin error should not take OpenCode down.
  */
 
 const PREFIX = "opencode-webhook"
 const SNIPPET_MAX = 500
 const FETCH_TIMEOUT_MS = 10_000
 const RETRY_DELAYS_MS = [0, 500, 1500]
-const TURN_DEDUPE_MS = 400
+const TURN_DEDUPE_MS = 2_000
 
 const EVENT_GROUPS = {
   idle: ["session.idle", "session.execution.succeeded"],
@@ -73,7 +71,6 @@ function readConfig() {
   return {
     url: env("OPENCODE_NOTIFY_WEBHOOK_URL", ""),
     secret: env("OPENCODE_NOTIFY_SECRET", ""),
-    authScheme: env("OPENCODE_NOTIFY_AUTH_SCHEME", "Bearer"),
     titlePrefix: env("OPENCODE_NOTIFY_TITLE_PREFIX", ""),
     events: parseEventFilter(env("OPENCODE_NOTIFY_EVENTS", "")),
     debug: truthy(env("OPENCODE_NOTIFY_DEBUG", "")),
@@ -110,8 +107,12 @@ function log(level, message, cfg) {
   writeLog(level === "debug" ? "info" : level, message)
 }
 
+function bagOf(event) {
+  return event?.properties || event?.data || {}
+}
+
 function sessionIDOf(event) {
-  const bag = event?.properties || event?.data || {}
+  const bag = bagOf(event)
   return bag.sessionID || bag.sessionId || bag.info?.id || null
 }
 
@@ -122,12 +123,24 @@ function statusOf(type) {
 }
 
 function errorOf(event) {
-  const bag = event?.properties || event?.data || {}
+  const bag = bagOf(event)
   return bag.error || null
 }
 
+function unwrap(value) {
+  if (value == null) return null
+  // @opencode-ai/sdk 1.19.x returns { data, error } from client methods.
+  if (typeof value === "object" && !Array.isArray(value) && "data" in value && value.title == null && value.info == null) {
+    return value.data
+  }
+  return value
+}
+
 function snippetFromMessages(messages) {
-  const list = Array.isArray(messages) ? messages : messages?.data || messages?.messages || []
+  const unwrapped = unwrap(messages)
+  const list = Array.isArray(unwrapped)
+    ? unwrapped
+    : unwrapped?.data || unwrapped?.messages || messages?.data || messages?.messages || []
   for (let i = list.length - 1; i >= 0; i--) {
     const m = list[i]
     const role = m?.info?.role || m?.role
@@ -156,7 +169,7 @@ function directoryOf(session) {
 async function tryCall(fns) {
   for (const fn of fns) {
     try {
-      const value = await fn()
+      const value = unwrap(await fn())
       if (value != null) return value
     } catch {
       // OpenCode 1 and 2 expose slightly different client methods.
@@ -166,9 +179,13 @@ async function tryCall(fns) {
 }
 
 async function enrich(ctx, sessionID) {
-  const out = { title: null, directory: null, snippet: null }
+  const out = {
+    title: null,
+    directory: ctx?.directory || ctx?.worktree || null,
+    snippet: null,
+  }
   try {
-    const sessionApi = ctx?.session || ctx?.client?.session
+    const sessionApi = ctx?.client?.session || ctx?.session
     if (!sessionApi) return out
     const session = await tryCall([
       () => sessionApi.get({ path: { id: sessionID } }),
@@ -177,7 +194,7 @@ async function enrich(ctx, sessionID) {
     ])
     if (session) {
       out.title = titleOf(session)
-      out.directory = directoryOf(session)
+      out.directory = directoryOf(session) || out.directory
     }
     const messages = await tryCall([
       () => sessionApi.messages({ path: { id: sessionID }, query: { limit: 8 } }),
@@ -186,7 +203,7 @@ async function enrich(ctx, sessionID) {
     ])
     if (messages) out.snippet = snippetFromMessages(messages)
   } catch {
-    // Snippet and title are optional; still send the webhook.
+    // Title and snippet are optional; still send the webhook.
   }
   return out
 }
@@ -200,14 +217,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function authHeader(secret, scheme) {
-  if (!secret) return null
-  const trimmed = String(scheme || "").trim()
-  if (!trimmed || /^raw$/i.test(trimmed)) return secret
-  return `${trimmed} ${secret}`
-}
-
-export function createRuntime() {
+function createRuntime() {
   const firedIds = new Set()
   const recentTurn = new Map()
   let warnedMissingUrl = false
@@ -245,6 +255,10 @@ export function createRuntime() {
     const prev = recentTurn.get(key)
     if (prev && now - prev < TURN_DEDUPE_MS) return true
     recentTurn.set(key, now)
+    if (recentTurn.size > 1000) {
+      const first = recentTurn.keys().next().value
+      recentTurn.delete(first)
+    }
     return false
   }
 
@@ -253,8 +267,7 @@ export function createRuntime() {
     const cfg = readConfig()
 
     const headers = { "content-type": "application/json" }
-    const authorization = authHeader(cfg.secret, cfg.authScheme)
-    if (authorization) headers.authorization = authorization
+    if (cfg.secret) headers.authorization = `Bearer ${cfg.secret}`
     const dest = safeUrl(cfg.url)
     const body = JSON.stringify(payload)
 
@@ -262,9 +275,9 @@ export function createRuntime() {
       if (RETRY_DELAYS_MS[i]) await sleep(RETRY_DELAYS_MS[i])
       const ac = new AbortController()
       const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS)
+      if (typeof timer.unref === "function") timer.unref()
       try {
         const res = await fetch(cfg.url, { method: "POST", headers, body, signal: ac.signal })
-        clearTimeout(timer)
         if (res.ok || res.status === 204) {
           log("debug", `webhook POST ${res.status} -> ${dest}`, cfg)
           return true
@@ -275,13 +288,14 @@ export function createRuntime() {
         }
         log("warn", `webhook POST ${res.status}, retrying -> ${dest}`, cfg)
       } catch (err) {
-        clearTimeout(timer)
         const name = err?.name || "error"
         if (i === RETRY_DELAYS_MS.length - 1) {
           log("error", `webhook POST failed (${name}) -> ${dest}`, cfg)
           return false
         }
         log("warn", `webhook POST ${name}, retrying -> ${dest}`, cfg)
+      } finally {
+        clearTimeout(timer)
       }
     }
     return false
@@ -297,18 +311,19 @@ export function createRuntime() {
 
     const extra = await enrich(ctx, sessionID)
     if (!shouldNotify(extra.title, cfg.titlePrefix)) {
-      log("debug", `skip ${event.type} for ${sessionID} (title prefix)`, cfg)
+      log("debug", `skip ${event.type} (title prefix)`, cfg)
       return false
     }
 
     return postWebhook({
       event: event.type,
-      eventID: event.id || null,
+      status,
       sessionID,
       title: extra.title,
       directory: extra.directory,
-      status,
       snippet: extra.snippet,
+      timestamp: new Date().toISOString(),
+      eventID: event.id || null,
       error: errorOf(event),
     })
   }
@@ -316,43 +331,66 @@ export function createRuntime() {
   return { handleEvent, postWebhook, ensureConfigured }
 }
 
-const fallback = createRuntime()
-export const handleEvent = (event, ctx) => fallback.handleEvent(event, ctx)
-export const postWebhook = (payload) => fallback.postWebhook(payload)
-
 /**
- * OpenCode 1.19+ calls this as `default.server(input, options)` and
- * expects a hooks object back. Never throw from here.
+ * OpenCode 1.19+ calls `default.server(input, options)` and expects Hooks.
+ * Older loaders call this function export directly. Never throw from here.
  */
-export async function server(ctx = {}) {
+export async function server(input = {}, _options) {
   try {
     const runtime = createRuntime()
     const cfg = readConfig()
     if (runtime.ensureConfigured()) log("debug", `loaded, webhook ${safeUrl(cfg.url)}`, cfg)
 
-    const hooks = {
-      event: async (input) => {
-        try {
-          const event = input?.event ?? input
-          await runtime.handleEvent(event, ctx)
-        } catch (err) {
-          log("error", `handler failed: ${err?.name || "error"}`, readConfig())
-        }
-      },
+    const onEvent = async (raw) => {
+      try {
+        const event = raw?.event ?? raw
+        await runtime.handleEvent(event, input)
+      } catch (err) {
+        log("error", `handler failed: ${err?.name || "error"}`, readConfig())
+      }
     }
 
-    // Newer OpenCode builds may expose a subscribe() stream. 1.19.6
-    // delivers events through the hook above instead.
-    if (ctx?.event?.subscribe) {
+    const hooks = {
+      event: onEvent,
+    }
+
+    // OpenCode 2 may expose a subscribe() stream or data.on() instead of
+    // the v1 event hook. 1.19.6 uses the hook above
+    // (plugin/index.ts listen → hook.event({ event: { id, type, properties } })).
+    if (typeof input?.data?.on === "function") {
+      try {
+        const types = Object.values(EVENT_GROUPS).flat()
+        const stops = types
+          .map((type) => {
+            try {
+              return input.data.on(type, (event) => onEvent(event))
+            } catch {
+              return null
+            }
+          })
+          .filter(Boolean)
+        if (stops.length) {
+          hooks.dispose = async () => {
+            for (const stop of stops) {
+              try {
+                if (typeof stop === "function") stop()
+              } catch {
+                // ignore
+              }
+            }
+          }
+        }
+      } catch (err) {
+        log("error", `data.on failed: ${err?.name || "error"}`, readConfig())
+      }
+    }
+
+    if (input?.event?.subscribe) {
       const controller = new AbortController()
       void (async () => {
         try {
-          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-            try {
-              await runtime.handleEvent(event, ctx)
-            } catch (err) {
-              log("error", `handler failed: ${err?.name || "error"}`, readConfig())
-            }
+          for await (const event of input.event.subscribe({ signal: controller.signal })) {
+            await onEvent(event)
           }
         } catch (err) {
           if (err?.name !== "AbortError") {
@@ -360,7 +398,11 @@ export async function server(ctx = {}) {
           }
         }
       })()
-      hooks.dispose = async () => controller.abort()
+      const prevDispose = hooks.dispose
+      hooks.dispose = async () => {
+        controller.abort()
+        if (prevDispose) await prevDispose()
+      }
     }
 
     return hooks
@@ -370,11 +412,14 @@ export async function server(ctx = {}) {
   }
 }
 
-
-// Named function exports for older loaders that scan for plugin functions.
+// Named function aliases for older loaders that scan exports for a plugin
+// function. Keep every named export a plugin function (or an alias of one)
+// so the 1.19.6 legacy path in getLegacyPlugins() does not throw
+// "Plugin export is not a function".
 export const DoneWebhook = server
 export const Plugin = server
 
-// OpenCode 1.19.6: path plugins must default-export an object with
-// `id` and `server()`. See readV1Plugin() in the source linked above.
-export default { id: "opencode-webhook", server }
+// Dual default: v1.19+ requires server(); v2 loaders look for setup().
+// Extra keys are ignored by readV1Plugin as long as tui is not also set.
+const plugin = { id: "opencode-webhook", server, setup: server }
+export default plugin
