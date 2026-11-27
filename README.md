@@ -1,7 +1,7 @@
 # opencode-webhook
 
 Get pinged when an [OpenCode](https://opencode.ai) agent finishes — or
-fails, gets blocked, or stalls.
+fails, gets blocked, hits model/API errors, or stalls.
 
 Any bot or service can hand off a coding task over OpenCode's HTTP API.
 This plugin, running inside your OpenCode server, POSTs a small JSON
@@ -54,7 +54,7 @@ export OPENCODE_NOTIFY_SECRET="your-shared-secret"
 export OPENCODE_NOTIFY_TITLE_PREFIX="MyBot: "
 
 # Which events to post. Comma-separated.
-# Groups: idle, error, interrupted, blocked, stalled, tool_error
+# Groups: idle, error, interrupted, blocked, retrying, stalled, tool_error
 # Default: everything except tool_error (agents recover from most tool errors).
 # Or full names: session.idle, session.error, permission.asked, ...
 export OPENCODE_NOTIFY_EVENTS="idle,error,blocked,stalled"
@@ -138,6 +138,7 @@ Switch on `kind`:
 | `aborted` | `error` | `session.error` with `MessageAbortedError` | `null`; see `error` |
 | `interrupted` | `interrupted` | v2 `session.execution.interrupted` | `null` |
 | `blocked` | `blocked` | `permission.asked` or `question.asked` — the session is waiting for an answer | `{ reason: "permission" \| "question", requestID, permission, patterns, command }` or `{ reason, requestID, question }` |
+| `retrying` | `retrying` | First `session.status` of type `retry`: a model/API call failed and OpenCode is retrying (e.g. the model server is out of memory or down). Once per retry streak; re-arms after real progress. | `{ attempt, message, nextRetryAt }` |
 | `stalled` | `stalled` | Busy with no message/tool/permission activity for `OPENCODE_NOTIFY_STALL_MINUTES` | `{ minutesSinceActivity, lastActivity }` |
 | `tool_error` | `tool_error` | A tool call errored (opt-in group) | `{ tool, error }` |
 

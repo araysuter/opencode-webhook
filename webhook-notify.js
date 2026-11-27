@@ -52,10 +52,11 @@ const EVENT_GROUPS = {
   error: ["session.error", "session.execution.failed"],
   interrupted: ["session.execution.interrupted"],
   blocked: ["permission.asked", "question.asked"],
+  retrying: ["session.status"],
   stalled: ["stalled"],
   tool_error: ["tool.error"],
 }
-const DEFAULT_GROUPS = ["idle", "error", "interrupted", "blocked", "stalled"]
+const DEFAULT_GROUPS = ["idle", "error", "interrupted", "blocked", "retrying", "stalled"]
 
 function env(name, fallback) {
   const value = process.env[name]
@@ -153,7 +154,7 @@ function clip(value, max = 300) {
  * `status` keeps the 1.1 values (idle | error | interrupted) for old
  * receivers; new kinds (blocked, stalled, tool_error) use status = kind.
  * `kind` is the clear one to switch on:
- *   finished | error | aborted | interrupted | blocked | stalled | tool_error
+ *   finished | error | aborted | interrupted | blocked | retrying | stalled | tool_error
  */
 function classify(event) {
   const type = event?.type
@@ -191,6 +192,18 @@ function classify(event) {
           reason: "question",
           requestID: bag.id || null,
           question: clip(bag.questions?.[0]?.question || bag.questions?.[0]?.header || null),
+        },
+      }
+    case "session.status":
+      // Model/API call failed and OpenCode is retrying (e.g. server out of RAM).
+      if (bag.status?.type !== "retry") return null
+      return {
+        kind: "retrying",
+        status: "retrying",
+        detail: {
+          attempt: bag.status.attempt ?? null,
+          message: clip(bag.status.message || ""),
+          nextRetryAt: bag.status.next ? new Date(bag.status.next).toISOString() : null,
         },
       }
     case "stalled":
@@ -437,6 +450,7 @@ function createRuntime() {
       s.retry = { attempt: bag.status.attempt ?? null, message: clip(bag.status.message || "") }
       return
     }
+    if (event.type !== "session.status") s.retryPinged = false
     s.last = Date.now()
     s.stalledSent = false
     s.retry = null
@@ -484,7 +498,12 @@ function createRuntime() {
     const info = classify(event)
     if (!info) return false
     const status = info.status
-    if (info.key) {
+    if (info.kind === "retrying") {
+      // One ping per retry streak; re-arms after real progress or idle.
+      const s = sessions.get(sessionID)
+      if (!s || s.retryPinged) return false
+      s.retryPinged = true
+    } else if (info.key) {
       if (firedIds.has(info.key)) return false
       firedIds.add(info.key)
       if (firedIds.size > 1000) firedIds.delete(firedIds.values().next().value)

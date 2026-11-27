@@ -708,9 +708,9 @@ test("model retries do not reset the stall clock and show in detail", async () =
     await hooks.event(ev("session.status", { sessionID: "ses_r", status: { type: "busy" } }))
     await hooks.event(ev("session.status", { sessionID: "ses_r", status: { type: "retry", attempt: 3, message: "Insufficient RAM" } }))
     await hooks.__checkStalls(Date.now() + 61_000)
-    assert.equal(col.posts.length, 1)
-    assert.equal(col.posts[0].body.kind, "stalled")
-    assert.deepEqual(col.posts[0].body.detail.retry, { attempt: 3, message: "Insufficient RAM" })
+    const stalled = col.posts.filter((p) => p.body.kind === "stalled")
+    assert.equal(stalled.length, 1)
+    assert.deepEqual(stalled[0].body.detail.retry, { attempt: 3, message: "Insufficient RAM" })
   })
 })
 
@@ -732,6 +732,27 @@ test("idle with an unfinished, error-free assistant message is kind aborted; fin
       await col.close()
     }
   }
+})
+
+test("first model retry pings retrying once per streak, re-arms after progress", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    const retry = (n) => ev("session.status", { sessionID: "ses_rt", status: { type: "retry", attempt: n, message: "Insufficient RAM for another full-context request", next: 1795810378961 } })
+    await hooks.event(ev("session.status", { sessionID: "ses_rt", status: { type: "busy" } }))
+    await hooks.event(retry(1))
+    await hooks.event(ev("session.status", { sessionID: "ses_rt", status: { type: "busy" } }))
+    await hooks.event(retry(2))
+    assert.equal(col.posts.length, 1)
+    const b = col.posts[0].body
+    assert.equal(b.kind, "retrying")
+    assert.equal(b.status, "retrying")
+    assert.equal(b.detail.attempt, 1)
+    assert.match(b.detail.message, /Insufficient RAM/)
+    await hooks.event(ev("message.part.delta", { sessionID: "ses_rt", delta: "ok" }))
+    await hooks.event(retry(1))
+    assert.equal(col.posts.length, 2)
+    await hooks.event(ev("session.status", { sessionID: "ses_rt", status: { type: "busy" } }))
+    assert.equal(col.posts.length, 2)
+  })
 })
 
 let failed = 0

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 — 2026-11-27
+
+- `retrying`: ping on the first `session.status` of type `retry` (model or
+  API call failed, OpenCode retrying silently), with `attempt`, `message`,
+  and `nextRetryAt`. Once per retry streak; re-arms after real progress.
+
 ## 1.2.0 — 2026-11-27
 
 - New `kind` field: `finished`, `error`, `aborted`, `interrupted`,
