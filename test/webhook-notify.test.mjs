@@ -565,6 +565,175 @@ test("client lookup failures are soft and still post", async () => {
   }
 })
 
+function ev(type, properties, id) {
+  return { event: { id: id || `evt_${type}_${Math.random()}`, type, properties } }
+}
+
+async function withPlugin(vars, fn) {
+  const col = await startCollector()
+  try {
+    await withEnv({ OPENCODE_NOTIFY_WEBHOOK_URL: col.url, OPENCODE_NOTIFY_TITLE_PREFIX: null, OPENCODE_NOTIFY_EVENTS: null, OPENCODE_NOTIFY_STALL_MINUTES: null, ...vars }, async () => {
+      const plugin = (await freshImport()).default
+      const hooks = await plugin.server({ directory: "/tmp/demo" })
+      try {
+        await fn(hooks, col)
+      } finally {
+        if (hooks.dispose) await hooks.dispose()
+      }
+    })
+  } finally {
+    await col.close()
+  }
+}
+
+test("idle keeps status idle and adds kind finished", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    await hooks.event(idleEvent("ses_k1", "evt_k1"))
+    assert.equal(col.posts[0].body.status, "idle")
+    assert.equal(col.posts[0].body.kind, "finished")
+  })
+})
+
+test("aborted session.error is kind aborted, other errors kind error", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    await hooks.event(ev("session.error", { sessionID: "ses_a", error: { name: "MessageAbortedError" } }))
+    await hooks.event(ev("session.error", { sessionID: "ses_b", error: { name: "APIError" } }))
+    assert.deepEqual(col.posts.map((p) => [p.body.status, p.body.kind]), [["error", "aborted"], ["error", "error"]])
+  })
+})
+
+test("permission.asked posts one blocked ping per request", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    const ask = { id: "per_1", sessionID: "ses_p", permission: "external_directory", patterns: ["/tmp/*"], metadata: { command: "mkdir -p /tmp/x" }, always: [] }
+    await hooks.event(ev("permission.asked", ask, "e1"))
+    await hooks.event(ev("permission.asked", ask, "e2"))
+    assert.equal(col.posts.length, 1)
+    const b = col.posts[0].body
+    assert.equal(b.kind, "blocked")
+    assert.equal(b.status, "blocked")
+    assert.equal(b.detail.reason, "permission")
+    assert.equal(b.detail.requestID, "per_1")
+    assert.equal(b.detail.permission, "external_directory")
+    assert.equal(b.detail.command, "mkdir -p /tmp/x")
+  })
+})
+
+test("question.asked posts a blocked ping", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    await hooks.event(ev("question.asked", { id: "que_1", sessionID: "ses_q", questions: [{ question: "Which branch?" }] }))
+    assert.equal(col.posts[0].body.kind, "blocked")
+    assert.equal(col.posts[0].body.detail.reason, "question")
+  })
+})
+
+test("watchdog sends one stalled ping, resets on activity, skips blocked sessions", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1" }, async (hooks, col) => {
+    await hooks.event(ev("session.status", { sessionID: "ses_s", status: { type: "busy" } }))
+    await hooks.event(ev("session.status", { sessionID: "ses_blk", status: { type: "busy" } }))
+    await hooks.event(ev("permission.asked", { id: "per_9", sessionID: "ses_blk", permission: "bash", patterns: [] }))
+    col.posts.length = 0
+    const later = Date.now() + 61_000
+    await hooks.__checkStalls(later)
+    await hooks.__checkStalls(later + 1000)
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.kind, "stalled")
+    assert.equal(col.posts[0].body.sessionID, "ses_s")
+    assert.ok(col.posts[0].body.detail.minutesSinceActivity >= 1)
+    await hooks.event(ev("message.part.delta", { sessionID: "ses_s", delta: "x" }))
+    await hooks.__checkStalls(Date.now() + 61_000)
+    assert.equal(col.posts.length, 2)
+    await hooks.event(ev("session.idle", { sessionID: "ses_s" }))
+    col.posts.length = 0
+    await hooks.__checkStalls(Date.now() + 120_000)
+    assert.equal(col.posts.filter((p) => p.body.kind === "stalled").length, 0)
+  })
+})
+
+test("STALL_MINUTES=0 disables the watchdog", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "0" }, async (hooks, col) => {
+    await hooks.event(ev("session.status", { sessionID: "ses_z", status: { type: "busy" } }))
+    await hooks.__checkStalls(Date.now() + 3_600_000)
+    assert.equal(col.posts.length, 0)
+  })
+})
+
+test("tool errors are opt-in via the tool_error group", async () => {
+  const part = { type: "tool", sessionID: "ses_t", callID: "call_1", tool: "bash", state: { status: "error", error: "boom" } }
+  await withPlugin({}, async (hooks, col) => {
+    await hooks.event(ev("message.part.updated", { part }))
+    assert.equal(col.posts.length, 0)
+  })
+  await withPlugin({ OPENCODE_NOTIFY_EVENTS: "error,tool_error" }, async (hooks, col) => {
+    await hooks.event(ev("message.part.updated", { part }))
+    await hooks.event(ev("message.part.updated", { part }))
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.kind, "tool_error")
+    assert.deepEqual(col.posts[0].body.detail, { tool: "bash", error: "boom" })
+  })
+})
+
+function clientWith(messages) {
+  return { session: { get: async () => ({ data: { title: "Bot: t", directory: "/r" } }), messages: async () => ({ data: messages }) } }
+}
+
+test("idle after an aborted message is kind aborted (API abort emits only idle)", async () => {
+  const col = await startCollector()
+  try {
+    await withEnv({ OPENCODE_NOTIFY_WEBHOOK_URL: col.url, OPENCODE_NOTIFY_TITLE_PREFIX: null, OPENCODE_NOTIFY_EVENTS: null }, async () => {
+      const plugin = (await freshImport()).default
+      const hooks = await plugin.server({ client: clientWith([{ info: { role: "assistant", error: { name: "MessageAbortedError", data: { message: "Aborted" } } }, parts: [] }]) })
+      await hooks.event(idleEvent("ses_ab", "evt_ab"))
+      await hooks.dispose?.()
+      const b = col.posts[0].body
+      assert.equal(b.status, "idle")
+      assert.equal(b.kind, "aborted")
+      assert.equal(b.error.name, "MessageAbortedError")
+    })
+  } finally {
+    await col.close()
+  }
+})
+
+test("session.error then session.idle sends one ping", async () => {
+  await withPlugin({}, async (hooks, col) => {
+    await hooks.event(ev("session.error", { sessionID: "ses_e2", error: { name: "APIError" } }))
+    await hooks.event(idleEvent("ses_e2", "evt_e2"))
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.kind, "error")
+  })
+})
+
+test("model retries do not reset the stall clock and show in detail", async () => {
+  await withPlugin({ OPENCODE_NOTIFY_STALL_MINUTES: "1" }, async (hooks, col) => {
+    await hooks.event(ev("session.status", { sessionID: "ses_r", status: { type: "busy" } }))
+    await hooks.event(ev("session.status", { sessionID: "ses_r", status: { type: "retry", attempt: 3, message: "Insufficient RAM" } }))
+    await hooks.__checkStalls(Date.now() + 61_000)
+    assert.equal(col.posts.length, 1)
+    assert.equal(col.posts[0].body.kind, "stalled")
+    assert.deepEqual(col.posts[0].body.detail.retry, { attempt: 3, message: "Insufficient RAM" })
+  })
+})
+
+test("idle with an unfinished, error-free assistant message is kind aborted; finished ones are not", async () => {
+  for (const [info, want] of [
+    [{ role: "assistant", time: { created: 1 } }, "aborted"],
+    [{ role: "assistant", time: { created: 1, completed: 2 }, finish: "stop" }, "finished"],
+  ]) {
+    const col = await startCollector()
+    try {
+      await withEnv({ OPENCODE_NOTIFY_WEBHOOK_URL: col.url, OPENCODE_NOTIFY_TITLE_PREFIX: null, OPENCODE_NOTIFY_EVENTS: null }, async () => {
+        const plugin = (await freshImport()).default
+        const hooks = await plugin.server({ client: clientWith([{ info, parts: [] }]) })
+        await hooks.event(idleEvent("ses_u", "evt_u"))
+        await hooks.dispose?.()
+        assert.equal(col.posts[0].body.kind, want)
+      })
+    } finally {
+      await col.close()
+    }
+  }
+})
+
 let failed = 0
 for (const { name, fn } of tests) {
   try {

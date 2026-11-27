@@ -1,11 +1,13 @@
 # opencode-webhook
 
-Get pinged when an [OpenCode](https://opencode.ai) agent finishes.
+Get pinged when an [OpenCode](https://opencode.ai) agent finishes — or
+fails, gets blocked, or stalls.
 
 Any bot or service can hand off a coding task over OpenCode's HTTP API.
 This plugin, running inside your OpenCode server, POSTs a small JSON
-webhook when that session goes idle or errors — so the caller can hear
-back without polling.
+webhook when that session finishes, errors, is waiting on a permission
+or question prompt nobody can answer, or goes quiet while still busy —
+so the caller always hears back without polling.
 
 It is one JavaScript file. It runs under Node and Bun, and it is written
 so a plugin error cannot take OpenCode down.
@@ -51,10 +53,15 @@ export OPENCODE_NOTIFY_SECRET="your-shared-secret"
 # Unset = notify every finished session.
 export OPENCODE_NOTIFY_TITLE_PREFIX="MyBot: "
 
-# Which events to post. Comma-separated. Default is all of them.
-# Groups: idle, error, interrupted
-# Or full names: session.idle, session.error, session.execution.succeeded, ...
-export OPENCODE_NOTIFY_EVENTS="idle,error"
+# Which events to post. Comma-separated.
+# Groups: idle, error, interrupted, blocked, stalled, tool_error
+# Default: everything except tool_error (agents recover from most tool errors).
+# Or full names: session.idle, session.error, permission.asked, ...
+export OPENCODE_NOTIFY_EVENTS="idle,error,blocked,stalled"
+
+# Send one "stalled" ping if a session stays busy with no activity this
+# many minutes (resets on any activity). Default 10. 0 turns it off.
+export OPENCODE_NOTIFY_STALL_MINUTES=10
 
 # Verbose logs, prefixed with "opencode-webhook:". Never logs the secret
 # or the URL query string.
@@ -110,14 +117,45 @@ one you set with `OPENCODE_SERVER_PASSWORD` when you started the server.
 {
   "event": "session.idle",
   "status": "idle",
+  "kind": "finished",
   "sessionID": "ses_example",
   "title": "Fix the login bug",
   "directory": "/path/to/your/repo",
   "snippet": "Opened a pull request with the login fix.",
   "timestamp": "2026-11-27T17:00:00.000Z",
   "eventID": "evt_example",
-  "error": null
+  "error": null,
+  "detail": null
 }
+```
+
+Switch on `kind`:
+
+| `kind` | `status` | When | `detail` |
+| --- | --- | --- | --- |
+| `finished` | `idle` | Session went idle (`session.idle`) | `null` |
+| `error` | `error` | `session.error` (not an abort) | `null`; see `error` |
+| `aborted` | `error` | `session.error` with `MessageAbortedError` | `null`; see `error` |
+| `interrupted` | `interrupted` | v2 `session.execution.interrupted` | `null` |
+| `blocked` | `blocked` | `permission.asked` or `question.asked` — the session is waiting for an answer | `{ reason: "permission" \| "question", requestID, permission, patterns, command }` or `{ reason, requestID, question }` |
+| `stalled` | `stalled` | Busy with no message/tool/permission activity for `OPENCODE_NOTIFY_STALL_MINUTES` | `{ minutesSinceActivity, lastActivity }` |
+| `tool_error` | `tool_error` | A tool call errored (opt-in group) | `{ tool, error }` |
+
+`status` keeps the old values (`idle`, `error`, `interrupted`) so older
+receivers keep working; new kinds use `status` = `kind`.
+
+Each problem is sent once: one `blocked` per permission request, one
+`stalled` per quiet stretch (it re-arms after new activity), one
+`tool_error` per tool call. A session blocked on a prompt does not also
+get a `stalled` ping.
+
+A `blocked` ping means OpenCode is waiting for a reply. Answer it with
+`POST /permission/<requestID>/reply` and `{"reply":"once"|"always"|"reject"}`,
+or avoid it entirely for headless use by allowing what your agents need
+in `opencode.json`, for example:
+
+```json
+"permission": { "external_directory": "allow", "doom_loop": "deny" }
 ```
 
 `status` is `idle` when the session finished, `error` when it failed, or
@@ -228,7 +266,7 @@ curl -N -u 'opencode:YOUR_PASSWORD' \
   'http://127.0.0.1:4096/event'
 ```
 
-Watch for `session.idle` or `session.error` (and, on OpenCode 2,
+Watch for `session.idle`, `session.error`, or `permission.asked` (and, on OpenCode 2,
 `session.execution.succeeded` / `failed` / `interrupted`). The plugin is
 the simpler path: it lives next to the server and POSTs your URL for you.
 

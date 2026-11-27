@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 — 2026-11-27
+
+- New `kind` field: `finished`, `error`, `aborted`, `interrupted`,
+  `blocked`, `stalled`, `tool_error`. `status` keeps its old values for
+  idle/error/interrupted, so existing receivers keep working.
+- `blocked`: ping on `permission.asked` and `question.asked` (event
+  names checked against OpenCode 1.19.6). Headless sessions used to sit
+  "busy" forever on a prompt nobody could see. `detail` carries the
+  request ID, permission, patterns, and command so the receiver can reply.
+- `stalled`: watchdog pings once if a session stays busy with no
+  activity for `OPENCODE_NOTIFY_STALL_MINUTES` (default 10, 0 = off).
+  Re-arms on activity. Skipped while a session is already blocked.
+- `tool_error` (opt-in group): ping when a tool call errors.
+- New `detail` field (null when not used). Dedupe per permission request,
+  per quiet stretch, and per tool call.
+
 ## 1.1.1 — 2026-11-27
 
 - Match the OpenCode 1.19.6 plugin loader exactly: path plugins must

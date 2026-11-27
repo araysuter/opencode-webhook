@@ -1,8 +1,9 @@
 /**
  * opencode-webhook
  *
- * POSTs JSON when an OpenCode session finishes or errors, so another
- * bot or service can hand off a task and get pinged when it is done.
+ * POSTs JSON when an OpenCode session finishes, fails, gets blocked on a
+ * permission/question prompt, or stalls, so another bot or service can
+ * hand off a task and always hear back.
  *
  * Install: copy this file to ~/.config/opencode/plugins/ or
  * .opencode/plugins/ in a project, then restart OpenCode.
@@ -12,7 +13,10 @@
  *   OPENCODE_NOTIFY_WEBHOOK_URL    Required. http(s) URL that receives the POST.
  *   OPENCODE_NOTIFY_SECRET         Optional. Sent as Authorization: Bearer <secret>.
  *   OPENCODE_NOTIFY_TITLE_PREFIX   Optional. Only sessions whose title starts with this.
- *   OPENCODE_NOTIFY_EVENTS         Optional. idle,error,interrupted or full event names.
+ *   OPENCODE_NOTIFY_EVENTS         Optional. Groups: idle,error,interrupted,blocked,stalled,
+ *                                  tool_error (tool_error is off by default) or full event names.
+ *   OPENCODE_NOTIFY_STALL_MINUTES  Optional. Busy with no activity this long = "stalled" ping.
+ *                                  Default 10. 0 disables the watchdog.
  *   OPENCODE_NOTIFY_DEBUG          Optional. 1/true for verbose logs.
  *
  * OpenCode 1.19.6 path plugins must default-export an object with `id`
@@ -37,12 +41,21 @@ const SNIPPET_MAX = 500
 const FETCH_TIMEOUT_MS = 10_000
 const RETRY_DELAYS_MS = [0, 500, 1500]
 const TURN_DEDUPE_MS = 2_000
+const ERROR_IDLE_DEDUPE_MS = 15_000
 
+const DEFAULT_STALL_MINUTES = 10
+
+// Bus event names verified against the OpenCode 1.19.6 binary.
+// "stalled" and "tool.error" are synthetic (made by this plugin).
 const EVENT_GROUPS = {
   idle: ["session.idle", "session.execution.succeeded"],
   error: ["session.error", "session.execution.failed"],
   interrupted: ["session.execution.interrupted"],
+  blocked: ["permission.asked", "question.asked"],
+  stalled: ["stalled"],
+  tool_error: ["tool.error"],
 }
+const DEFAULT_GROUPS = ["idle", "error", "interrupted", "blocked", "stalled"]
 
 function env(name, fallback) {
   const value = process.env[name]
@@ -55,7 +68,7 @@ function truthy(value) {
 }
 
 function parseEventFilter(raw) {
-  const allowed = new Set(Object.values(EVENT_GROUPS).flat())
+  const allowed = new Set(DEFAULT_GROUPS.flatMap((g) => EVENT_GROUPS[g]))
   if (!raw) return allowed
   const next = new Set()
   for (const token of raw.split(",")) {
@@ -67,6 +80,12 @@ function parseEventFilter(raw) {
   return next.size ? next : allowed
 }
 
+function stallMinutes(raw) {
+  if (raw === "") return DEFAULT_STALL_MINUTES
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_STALL_MINUTES
+}
+
 function readConfig() {
   return {
     url: env("OPENCODE_NOTIFY_WEBHOOK_URL", ""),
@@ -74,6 +93,7 @@ function readConfig() {
     titlePrefix: env("OPENCODE_NOTIFY_TITLE_PREFIX", ""),
     events: parseEventFilter(env("OPENCODE_NOTIFY_EVENTS", "")),
     debug: truthy(env("OPENCODE_NOTIFY_DEBUG", "")),
+    stallMinutes: stallMinutes(env("OPENCODE_NOTIFY_STALL_MINUTES", "")),
   }
 }
 
@@ -113,13 +133,87 @@ function bagOf(event) {
 
 function sessionIDOf(event) {
   const bag = bagOf(event)
-  return bag.sessionID || bag.sessionId || bag.info?.id || null
+  return (
+    bag.sessionID ||
+    bag.sessionId ||
+    bag.part?.sessionID ||
+    bag.info?.sessionID ||
+    (event?.type?.startsWith("session.") ? bag.info?.id : null) ||
+    null
+  )
 }
 
-function statusOf(type) {
-  if (type === "session.error" || type === "session.execution.failed") return "error"
-  if (type === "session.execution.interrupted") return "interrupted"
-  return "idle"
+function clip(value, max = 300) {
+  if (typeof value !== "string") return value ?? null
+  return value.length > max ? value.slice(0, max) + "…" : value
+}
+
+/**
+ * Turn a bus event into a notification, or null.
+ * `status` keeps the 1.1 values (idle | error | interrupted) for old
+ * receivers; new kinds (blocked, stalled, tool_error) use status = kind.
+ * `kind` is the clear one to switch on:
+ *   finished | error | aborted | interrupted | blocked | stalled | tool_error
+ */
+function classify(event) {
+  const type = event?.type
+  const bag = bagOf(event)
+  switch (type) {
+    case "session.idle":
+    case "session.execution.succeeded":
+      return { kind: "finished", status: "idle" }
+    case "session.error":
+    case "session.execution.failed": {
+      const name = bag.error?.name || ""
+      return { kind: /Abort/i.test(name) ? "aborted" : "error", status: "error" }
+    }
+    case "session.execution.interrupted":
+      return { kind: "interrupted", status: "interrupted" }
+    case "permission.asked":
+      return {
+        kind: "blocked",
+        status: "blocked",
+        key: `blocked:${bag.id}`,
+        detail: {
+          reason: "permission",
+          requestID: bag.id || null,
+          permission: bag.permission || null,
+          patterns: Array.isArray(bag.patterns) ? bag.patterns.slice(0, 10) : [],
+          command: clip(bag.metadata?.command),
+        },
+      }
+    case "question.asked":
+      return {
+        kind: "blocked",
+        status: "blocked",
+        key: `blocked:${bag.id}`,
+        detail: {
+          reason: "question",
+          requestID: bag.id || null,
+          question: clip(bag.questions?.[0]?.question || bag.questions?.[0]?.header || null),
+        },
+      }
+    case "stalled":
+      return { kind: "stalled", status: "stalled", key: `stalled:${bag.sessionID}:${bag.since}`, detail: bag.detail }
+    case "tool.error":
+      return { kind: "tool_error", status: "tool_error", key: `tool:${bag.callID}`, detail: bag.detail }
+    default:
+      return null
+  }
+}
+
+function toolErrorOf(event) {
+  if (event?.type !== "message.part.updated") return null
+  const part = bagOf(event).part
+  if (part?.type !== "tool" || part.state?.status !== "error") return null
+  return {
+    type: "tool.error",
+    properties: {
+      sessionID: part.sessionID,
+      callID: part.callID || part.id,
+      detail: { tool: part.tool || null, error: clip(String(part.state.error || "")) },
+    },
+  }
 }
 
 function errorOf(event) {
@@ -156,6 +250,25 @@ function snippetFromMessages(messages) {
   return null
 }
 
+function lastErrorFromMessages(messages) {
+  const unwrapped = unwrap(messages)
+  const list = Array.isArray(unwrapped) ? unwrapped : unwrapped?.data || unwrapped?.messages || []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const info = list[i]?.info || list[i]
+    if (info?.role !== "assistant") continue
+    const err = info.error
+    if (!err) {
+      // Went idle without the model finishing: aborted before any output.
+      if (!info.finish && info.time?.created) {
+        return { name: "MessageAbortedError", message: "Turn ended before the model finished" }
+      }
+      return null
+    }
+    return { name: err.name || "Error", message: clip(err.data?.message || err.message || "") }
+  }
+  return null
+}
+
 function titleOf(session) {
   const info = session?.info && session.title == null ? session.info : session
   return info?.title ?? null
@@ -183,6 +296,7 @@ async function enrich(ctx, sessionID) {
     title: null,
     directory: ctx?.directory || ctx?.worktree || null,
     snippet: null,
+    lastError: null,
   }
   try {
     const sessionApi = ctx?.client?.session || ctx?.session
@@ -201,7 +315,10 @@ async function enrich(ctx, sessionID) {
       () => sessionApi.messages({ sessionID, limit: 8 }),
       () => sessionApi.message?.list?.({ path: { id: sessionID }, query: { limit: 8 } }),
     ])
-    if (messages) out.snippet = snippetFromMessages(messages)
+    if (messages) {
+      out.snippet = snippetFromMessages(messages)
+      out.lastError = lastErrorFromMessages(messages)
+    }
   } catch {
     // Title and snippet are optional; still send the webhook.
   }
@@ -301,15 +418,95 @@ function createRuntime() {
     return false
   }
 
-  async function handleEvent(event, ctx) {
+  // Watchdog state per session: busy flag, last activity, open prompts.
+  const sessions = new Map()
+  const errorPinged = new Map()
+  function track(event) {
+    const sessionID = sessionIDOf(event)
+    if (!sessionID || event.type === "stalled") return
+    const bag = bagOf(event)
+    let s = sessions.get(sessionID)
+    if (!s) {
+      s = { busy: false, last: Date.now(), stalledSent: false, open: new Set() }
+      sessions.set(sessionID, s)
+      if (sessions.size > 500) sessions.delete(sessions.keys().next().value)
+    }
+    if (event.type === "session.status" && bag.status?.type === "retry") {
+      // Model retries are not progress; keep the stall clock running.
+      s.busy = true
+      s.retry = { attempt: bag.status.attempt ?? null, message: clip(bag.status.message || "") }
+      return
+    }
+    s.last = Date.now()
+    s.stalledSent = false
+    s.retry = null
+    if (event.type === "session.status") s.busy = bag.status?.type !== "idle"
+    else if (event.type === "session.idle" || event.type === "session.deleted") s.busy = false
+    else if (event.type === "permission.asked" || event.type === "question.asked") s.open.add(bag.id)
+    else if (/^(permission|question)\.(replied|rejected)$/.test(event.type)) s.open.delete(bag.requestID || bag.id)
+    if (event.type === "session.deleted") sessions.delete(sessionID)
+  }
+
+  function stalledEvents(now = Date.now()) {
     const cfg = readConfig()
-    if (!event || !cfg.events.has(event.type)) return false
+    const out = []
+    if (!cfg.stallMinutes) return out
+    const limit = cfg.stallMinutes * 60_000
+    for (const [sessionID, s] of sessions) {
+      // Blocked sessions already got a "blocked" ping; don't double up.
+      if (!s.busy || s.stalledSent || s.open.size || now - s.last < limit) continue
+      s.stalledSent = true
+      out.push({
+        type: "stalled",
+        properties: {
+          sessionID,
+          since: s.last,
+          detail: {
+            minutesSinceActivity: Math.floor((now - s.last) / 60_000),
+            lastActivity: new Date(s.last).toISOString(),
+            retry: s.retry || null,
+          },
+        },
+      })
+    }
+    return out
+  }
+
+  async function handleEvent(event, ctx) {
+    if (!event) return false
+    track(event)
+    const toolErr = toolErrorOf(event)
+    if (toolErr) await handleEvent(toolErr, ctx)
+    const cfg = readConfig()
+    if (!cfg.events.has(event.type)) return false
     const sessionID = sessionIDOf(event)
     if (!sessionID) return false
-    const status = statusOf(event.type)
-    if (alreadyFired(sessionID, status, event.id)) return false
+    const info = classify(event)
+    if (!info) return false
+    const status = info.status
+    if (info.key) {
+      if (firedIds.has(info.key)) return false
+      firedIds.add(info.key)
+      if (firedIds.size > 1000) firedIds.delete(firedIds.values().next().value)
+    } else if (alreadyFired(sessionID, status, event.id)) return false
 
     const extra = await enrich(ctx, sessionID)
+    let kind = info.kind
+    let error = errorOf(event)
+    if (kind === "finished" && extra.lastError) {
+      // 1.19.6 aborts via the API often emit only session.idle.
+      kind = /Abort/i.test(extra.lastError.name) ? "aborted" : "error"
+      error = extra.lastError
+    }
+    if (kind === "finished" || kind === "aborted" || kind === "error") {
+      // One ping per turn: skip the idle that follows an error ping.
+      const prev = errorPinged.get(sessionID)
+      if (info.kind === "finished" && prev && Date.now() - prev < ERROR_IDLE_DEDUPE_MS) return false
+      if (info.kind !== "finished") {
+        errorPinged.set(sessionID, Date.now())
+        if (errorPinged.size > 500) errorPinged.delete(errorPinged.keys().next().value)
+      }
+    }
     if (!shouldNotify(extra.title, cfg.titlePrefix)) {
       log("debug", `skip ${event.type} (title prefix)`, cfg)
       return false
@@ -318,17 +515,23 @@ function createRuntime() {
     return postWebhook({
       event: event.type,
       status,
+      kind,
       sessionID,
       title: extra.title,
       directory: extra.directory,
       snippet: extra.snippet,
       timestamp: new Date().toISOString(),
       eventID: event.id || null,
-      error: errorOf(event),
+      error,
+      detail: info.detail || null,
     })
   }
 
-  return { handleEvent, postWebhook, ensureConfigured }
+  async function checkStalls(ctx, now) {
+    for (const ev of stalledEvents(now)) await handleEvent(ev, ctx)
+  }
+
+  return { handleEvent, postWebhook, ensureConfigured, checkStalls, sessions }
 }
 
 /**
@@ -354,6 +557,18 @@ export async function server(input = {}, _options) {
       event: onEvent,
     }
 
+    // Stall watchdog: checks every 30s; never keeps the process alive.
+    const timer = setInterval(() => {
+      runtime.checkStalls(input).catch(() => {})
+    }, 30_000)
+    if (typeof timer.unref === "function") timer.unref()
+    hooks.dispose = async () => clearInterval(timer)
+    // Test hook, hidden from OpenCode's hook lookup.
+    Object.defineProperty(hooks, "__checkStalls", {
+      value: (now) => runtime.checkStalls(input, now),
+      enumerable: false,
+    })
+
     // OpenCode 2 may expose a subscribe() stream or data.on() instead of
     // the v1 event hook. 1.19.6 uses the hook above
     // (plugin/index.ts listen → hook.event({ event: { id, type, properties } })).
@@ -370,7 +585,9 @@ export async function server(input = {}, _options) {
           })
           .filter(Boolean)
         if (stops.length) {
+          const prevStopDispose = hooks.dispose
           hooks.dispose = async () => {
+            if (prevStopDispose) await prevStopDispose()
             for (const stop of stops) {
               try {
                 if (typeof stop === "function") stop()
