@@ -29,3 +29,26 @@ jobs:
         with:
           bun-version: latest
       - run: bun test/webhook-notify.test.mjs
+
+  opencode-smoke:
+    name: OpenCode ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - opencode-ai@1.19.6
+          - opencode-ai@latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install OpenCode CLI
+        run: npm install --global ${{ matrix.package }}
+      - name: Show version
+        run: opencode --version
+      - name: Load plugin with real CLI
+        run: node test/opencode-load-smoke.mjs
+        env:
+          OPENCODE_SMOKE_TIMEOUT_MS: "60000"

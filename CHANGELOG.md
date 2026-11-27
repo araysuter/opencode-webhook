@@ -1,30 +1,46 @@
 # Changelog
 
-## 1.1.0 — 2026-11-27
+## 1.1.1 — 2026-11-27
 
-- Fix the plugin export for OpenCode 1.19+: default-export
-  `{ id, server }` so the official loader no longer reports
-  `must default export an object with server()`.
-- Keep named function exports (`server`, `DoneWebhook`, `Plugin`) for
-  older loaders.
+- Match the OpenCode 1.19.6 plugin loader exactly: path plugins must
+  default-export `{ id, server }`. `server(input, options)` returns a
+  Hooks object. The original `{ id, setup }` default is what produced
+  `failed to load plugin` / `must default export an object with server()`.
+  Cited from
+  [shared.ts](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/shared.ts)
+  and
+  [index.ts](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/index.ts).
+- Keep named function exports (`server`, `DoneWebhook`, `Plugin`) as the
+  same function so older loaders that scan exports still see a plugin
+  function, without extra non-plugin named exports that would trip
+  `getLegacyPlugins()`.
+- Alias `setup` on the default export for OpenCode 2 loaders.
 - Never throw out of `server()` or the event hook. If
   `OPENCODE_NOTIFY_WEBHOOK_URL` is missing or invalid, log one warning
   and stay loaded as a no-op.
 - POST with a 10s timeout, and retry a couple of times with backoff on
   network errors or 5xx responses. Do not retry 4xx.
-- Dedupe `session.idle` and `session.execution.succeeded` for the same
-  session turn so a mixed 1.19 / v2 bus does not double-post.
-- Handle both `properties` and `data` event shapes, and truncate long
-  snippets.
-- Optional env: `OPENCODE_NOTIFY_EVENTS`, `OPENCODE_NOTIFY_DEBUG`,
-  `OPENCODE_NOTIFY_AUTH_SCHEME`.
+- Dedupe idle/error per session turn (including `session.idle` vs
+  `session.execution.succeeded`).
+- Handle both `properties` (1.19.6 maps bus `data` → `properties`) and
+  the v2 `data` event shape.
+- Payload includes `event`, `status`, `sessionID`, `title`, `directory`,
+  truncated last assistant snippet, and `timestamp`. Session extras are
+  fetched through the provided `client` and fail soft.
 - Logs use the `opencode-webhook:` prefix and never include the secret
   or the URL query string.
 - README troubleshooting (logs, tmux / systemd / launchd, webhook
-  inspector), compatibility notes, and project-level
-  `.opencode/plugins/` install.
-- GitHub Actions CI runs the tests on Node.js and Bun.
+  inspector), compatibility notes with source links, and project-level
+  `.opencode/plugins/` install. Examples use localhost, not personal hosts.
+- GitHub Actions CI runs unit tests on Node.js and Bun, plus an OpenCode
+  CLI load smoke test against 1.19.6 and latest.
+
+## 1.1.0 — 2026-11-27
+
+- First attempt at the 1.19+ `{ id, server }` export, hardening, tests,
+  and docs.
 
 ## 1.0.0 — 2026-11-27
 
-- Initial plugin, README, MIT license, and tests.
+- Initial plugin, README, MIT license, and tests. Default export was
+  `{ id, setup }`, which OpenCode 1.19.6 refuses to load.

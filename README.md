@@ -47,10 +47,6 @@ Optional:
 # Sent as: Authorization: Bearer <secret>
 export OPENCODE_NOTIFY_SECRET="your-shared-secret"
 
-# Use "raw" to send the secret as the entire Authorization value
-# (for webhooks that do not use Bearer). Default is Bearer.
-export OPENCODE_NOTIFY_AUTH_SCHEME="Bearer"
-
 # Only notify sessions whose title starts with this prefix.
 # Unset = notify every finished session.
 export OPENCODE_NOTIFY_TITLE_PREFIX="MyBot: "
@@ -79,9 +75,8 @@ again.
 OpenCode's server publishes an OpenAPI spec at `/doc`. These two calls
 are enough to start a task and return immediately.
 
-Use your own host, password, and project directory. If you reach the
-server over [Tailscale](https://tailscale.com), the host looks like
-`your-pc.your-tailnet.ts.net`.
+Use your own host, password, and project directory. The examples below
+talk to a local `opencode serve` on port 4096.
 
 **Create a session**
 
@@ -89,10 +84,10 @@ server over [Tailscale](https://tailscale.com), the host looks like
 curl -sS -u 'opencode:YOUR_PASSWORD' \
   -H 'Content-Type: application/json' \
   -d '{"title":"Fix the login bug"}' \
-  'https://your-pc.your-tailnet.ts.net:8443/session?directory=/path/to/your/repo'
+  'http://127.0.0.1:4096/session?directory=/path/to/your/repo'
 ```
 
-The response includes an `id` like `ses_...`. Use that as `SESSION_ID` below.
+The response includes an `id`. Use that as `SESSION_ID` below.
 
 **Send the prompt (fire and forget)**
 
@@ -100,7 +95,7 @@ The response includes an `id` like `ses_...`. Use that as `SESSION_ID` below.
 curl -sS -u 'opencode:YOUR_PASSWORD' \
   -H 'Content-Type: application/json' \
   -d '{"parts":[{"type":"text","text":"Fix the login bug. Open a PR when you are done."}]}' \
-  'https://your-pc.your-tailnet.ts.net:8443/session/SESSION_ID/prompt_async'
+  'http://127.0.0.1:4096/session/SESSION_ID/prompt_async'
 ```
 
 `prompt_async` returns **204 No Content** right away. The agent keeps
@@ -114,12 +109,13 @@ one you set with `OPENCODE_SERVER_PASSWORD` when you started the server.
 ```json
 {
   "event": "session.idle",
-  "eventID": "evt_...",
-  "sessionID": "ses_...",
+  "status": "idle",
+  "sessionID": "ses_example",
   "title": "Fix the login bug",
   "directory": "/path/to/your/repo",
-  "status": "idle",
   "snippet": "Opened a pull request with the login fix.",
+  "timestamp": "2026-11-27T17:00:00.000Z",
+  "eventID": "evt_example",
   "error": null
 }
 ```
@@ -135,8 +131,7 @@ payload is the same. The plugin treats `session.idle` and
 `session.execution.succeeded` as the same turn, so you get one POST, not two.
 
 If you set `OPENCODE_NOTIFY_SECRET`, the request includes
-`Authorization: Bearer <secret>` (or a raw Authorization value if you set
-`OPENCODE_NOTIFY_AUTH_SCHEME=raw`). Check that header before you trust the body.
+`Authorization: Bearer <secret>`. Check that header before you trust the body.
 
 The plugin times out after about 10 seconds and retries a couple of times
 on network errors or 5xx responses. It does not retry 4xx responses.
@@ -169,8 +164,8 @@ the plugin stays loaded, does nothing, and logs one warning starting with
    `%USERPROFILE%\.local\share\opencode\log\`.
 
 2. If you see `must default export an object with server()`, you have an
-   old copy of this file. Re-download it from this repo and restart
-   OpenCode.
+   old copy of this file (the original `{ id, setup }` export). Re-download
+   it from this repo and restart OpenCode.
 
 3. Confirm the environment variables reached the OpenCode process, not
    just your interactive shell:
@@ -196,18 +191,29 @@ the plugin stays loaded, does nothing, and logs one warning starting with
 
 ## Compatibility
 
-Tested against **OpenCode 1.19.6**, which loads plugins as
-`export default { id, server }` and delivers bus events through the
-`event` hook (`{ event: { id, type, properties } }`).
+Tested against **OpenCode 1.19.6** (`opencode-ai@1.19.6`). That release
+loads path plugins as `export default { id, server }`
+([`readV1Plugin()`](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/shared.ts),
+[`applyPlugin()`](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/plugin/index.ts))
+and delivers bus events through the `event` hook as
+`{ event: { id, type, properties } }`, where `properties` is the bus
+payload (`event.data` mapped in `plugin/index.ts`). Types:
+[@opencode-ai/plugin@1.19.6](https://cdn.jsdelivr.net/npm/@opencode-ai/plugin@1.19.6/dist/index.d.ts).
+
+`server(input, options)` receives
+`{ client, project, directory, worktree, $ }` and must return a hooks
+object. Path plugins must also export `id`.
 
 The same file also:
 
-- Exports `server` / `DoneWebhook` / `Plugin` as named functions, for
+- Exports `server` / `DoneWebhook` / `Plugin` as the same function, for
   older loaders that look for a plugin function instead of `server()`.
+- Puts `setup` on the default export (an alias of `server`) for OpenCode 2
+  loaders that look for `{ id, setup }`.
 - Accepts both the `properties` event shape (1.19) and the `data` shape
-  used by some v2 builds.
+  used by v2 `session.execution.*` events.
 - Handles v2 `session.execution.succeeded` / `failed` / `interrupted`
-  events in addition to `session.idle` and `session.error`.
+  in addition to `session.idle` and `session.error`.
 
 It uses standard `fetch`, `AbortController`, and ES modules, so it runs
 under current Node.js and Bun.
@@ -219,7 +225,7 @@ client can subscribe to the same events with a long-lived SSE request:
 
 ```bash
 curl -N -u 'opencode:YOUR_PASSWORD' \
-  'https://your-pc.your-tailnet.ts.net:8443/event'
+  'http://127.0.0.1:4096/event'
 ```
 
 Watch for `session.idle` or `session.error` (and, on OpenCode 2,
